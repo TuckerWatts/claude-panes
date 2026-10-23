@@ -1,0 +1,23 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/hooks/panes-feed.sh"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/tab-state.sh working", "async": true }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/tab-state.sh working", "async": true }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/tab-state.sh waiting", "async": true }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/tab-state.sh done", "async": true }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "~/.claude/hooks/tab-state.sh end" }] }
+    ]
+  }
+}

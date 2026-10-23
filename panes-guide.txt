@@ -1,0 +1,25 @@
+
+  panes — your Claude sessions in one window
+
+  big pane (left)     the session you're typing in
+  right column        dashboard for that session: usage,
+                      git, PR + checks, last handoff note
+  bottom left         a plain shell
+  bottom right        every session and its status;
+                      click one (or press its number) to
+                      swap it into the big pane
+
+  in the shell
+    claude [args]     new session in the big pane
+    panes             same, in the shell's directory
+    panes <project>   open / jump to a project
+    panes -k          close everything (chats are kept)
+
+  keys
+    ⌃b p              pick a project to open
+    ⌃b x              close the focused pane
+    ⌃b ?              this guide
+
+  /exit in a session closes its pane.
+
+  press any key

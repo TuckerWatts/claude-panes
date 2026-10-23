@@ -1,0 +1,17 @@
+# zshrc for the `panes` bottom shell strip: your
+# normal ~/.zshrc, then a one-line prompt so the short strip holds more.
+ZDOTDIR=$HOME
+source ~/.zshrc
+PROMPT='%F{cyan}%~%f %F{magenta}❯%f '
+RPROMPT=''
+
+# `claude` here opens a new session in the big pane instead of taking over
+# this shell. Subcommands and one-shot runs (-p, --version, …) still run
+# here; `command claude` forces it.
+claude() {
+  case $1 in
+    -p|--print|-h|--help|-v|--version|agents|attach|auth|config|doctor|install|mcp|migrate-installer|plugin|setup-token|update)
+      command claude "$@" ;;
+    *) ~/.local/bin/panes --new $PWD "$@" ;;
+  esac
+}

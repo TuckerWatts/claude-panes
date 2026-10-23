@@ -1,0 +1,475 @@
+#!/bin/zsh
+# panes — all your Claude sessions in ONE Terminal window.
+#
+#   panes                    your 4 most recent projects
+#   panes api web            pick projects (names under $PANES_ROOT, or paths);
+#                            if panes is already running, ADDS them to it
+#   panes -k                 close the workspace (conversations are kept)
+#   in the bottom shell:     `claude [args]`, `panes` or `panes .` opens a new
+#                            Claude session in the shell's current dir, in the
+#                            big pane (/exit closes it again)
+#   inside panes: ⌃b p       pick a project to open
+#
+# Terminal.app can't split into different sessions, so this runs tmux
+# (on its own socket and config, ~/.claude/panes.tmux.conf) inside the
+# current tab. Layout of the one visible window (panes:0):
+#   - the big pane on the left: the Claude session you're working in
+#   - a column on the right: a dashboard for that session (usage, git,
+#     PR, last handoff note)
+#   - along the bottom: a plain shell, and a list of every session with
+#     its status; click one (or press its number there) to swap it into
+#     the big pane
+# The sessions not in the big pane keep running, each in its own hidden
+# tmux window. Each runs `claude -c`, which resumes that project's last
+# conversation; if the project is still open in another tab, it waits and
+# takes over the moment you /exit it there.
+
+source ~/.claude/hooks/tab-colors.zsh
+: ${PANES_ROOT:=$HOME/code}   # where your projects live
+zmodload zsh/system
+T=(tmux -L claude -f ~/.claude/panes.tmux.conf)
+W0=panes:0  # the visible window
+self=~/.local/bin/panes
+run=~/.claude/hooks/pane-run.sh
+SHELL_H=8   # height of the bottom shell strip, in lines
+RECENT=4    # how many recent projects a fresh `panes` opens
+
+# project_dir <name|path>: a project name under $PANES_ROOT, or a path.
+project_dir() {
+  local a=$1
+  [[ $a == . ]] && { print -r -- $PWD; return; }
+  # Project names first (so "api" never means ./api by accident).
+  if [[ $a != */* && -d $PANES_ROOT/$a ]]; then
+    # A repo nested as <root>/api/api: prefer the nested repo.
+    [[ -d $PANES_ROOT/$a/$a/.git ]] && print -r -- $PANES_ROOT/$a/$a || print -r -- $PANES_ROOT/$a
+  elif [[ -d $a ]]; then print -r -- ${a:A}
+  else return 1; fi
+}
+
+# Claude panes carry @dir; the others carry @info/@shell/@list.
+open_dirs()    { $T list-panes -s -t panes -F '#{@dir}' 2>/dev/null | grep -v '^$'; }
+claude_all()   { $T list-panes -s -t panes -F '#{@dir}|#{pane_id}' 2>/dev/null | awk -F'|' '$1!=""{print $2}'; }
+claude_here()  { $T list-panes -t $W0 -F '#{@dir}|#{pane_id}' 2>/dev/null | awk -F'|' '$1!=""{print $2}'; }
+role_pane()    { $T list-panes -t $W0 -F "#{@$1} #{pane_id}" 2>/dev/null | awk '$1==1{print $2; exit}'; }
+
+# One relayout/swap at a time (the hooks fire several at once).
+lock()   { zsystem flock -t 5 -f LOCKFD ~/.claude/.panes.lock 2>/dev/null; }
+unlock() { [[ -n $LOCKFD ]] && zsystem flock -u $LOCKFD; LOCKFD=; }
+
+# relayout: one Claude pane in the big spot on the left, the dashboard in
+# a column on the right, shell + session list along the bottom. Any other
+# Claude pane that lands in the visible window takes the big spot if it's
+# focused; the rest move to their own hidden windows.
+relayout() {
+  $T has-session -t panes 2>/dev/null || return
+  lock
+  { _relayout } always { unlock }
+}
+_relayout() {
+  ensure_info; ensure_shell; ensure_list
+  local -a here=(${(f)"$(claude_here)"})
+  local act main p lp=$(role_pane info) sh=$(role_pane shell) fd=$(role_pane list)
+  act=$($T display -p -t $W0 '#{pane_id}')
+  main=$($T show -wqv -t $W0 @main)
+  (( ${here[(Ie)$act]} )) && main=$act
+  (( ${here[(Ie)$main]} )) || main=$here[1]
+  for p in $here; do [[ $p == $main ]] || $T break-pane -d -s $p; done
+  if [[ -z $main ]]; then
+    # The big spot's Claude exited: bring in another session, if any.
+    main=$(claude_all | head -1)
+    [[ -n $main && -n $lp ]] && $T join-pane -d -h -b -s $main -t $lp || main=
+  fi
+  [[ -n $main ]] && $T set -w -t $W0 @main $main
+
+  # tmux fills layout slots in its own pane order (ignoring the ids in the
+  # layout text), so first swap panes into that order: main, info, shell, list.
+  local -a want=($main $lp $sh $fd) cur; local i
+  for (( i = 1; i <= $#want; i++ )); do
+    cur=(${(f)"$($T list-panes -t $W0 -F '#{pane_id}')"})
+    [[ $cur[i] == $want[i] ]] || $T swap-pane -d -s $want[i] -t $cur[i]
+  done
+  local W H
+  read W H <<< "$($T display -p -t $W0 '#{window_width} #{window_height}')"
+
+  # Tall enough for one line per session (up to a third of the window).
+  local avail=$H sh_h=$SHELL_H n=${#${(f)"$(claude_all)"}}
+  (( n + 1 > sh_h )) && sh_h=$(( n + 1 ))
+  (( sh_h > H / 3 )) && sh_h=$(( H / 3 ))
+  (( SHELL_H < H / 4 && sh_h < SHELL_H )) && sh_h=$SHELL_H
+  (( sh_h > H / 3 )) && sh_h=$(( H / 3 ))   # small windows: keep Claude on top
+  (( sh_h < 3 )) && sh_h=3
+  [[ -z $main$lp ]] && sh_h=$H
+  [[ -n $sh$fd && -n $main$lp ]] && (( avail = H - sh_h - 1 ))
+
+  local top=""
+  # Dashboard column: about 30% of the width, 40–60 columns.
+  local sw=$(( W * 30 / 100 )); (( sw < 40 )) && sw=40; (( sw > 60 )) && sw=60
+  if [[ -n $main && -n $lp ]]; then
+    local mw=$(( W - sw - 1 ))
+    top="${W}x${avail},0,0{${mw}x${avail},0,0,${main#%},${sw}x${avail},$(( mw + 1 )),0,${lp#%}}"
+  elif [[ -n $main$lp ]]; then
+    top="${W}x${avail},0,0,${${main:-$lp}#%}"
+  fi
+
+  local body
+  # Bottom strip: shell on the left, session list on the right.
+  local strip="" sy=$(( H - sh_h ))
+  if [[ -n $sh && -n $fd ]]; then
+    local lw=$(( (W - 1) / 2 ))
+    strip="${W}x${sh_h},0,${sy}{${lw}x${sh_h},0,${sy},${sh#%},$(( W - lw - 1 ))x${sh_h},$(( lw + 1 )),${sy},${fd#%}}"
+  elif [[ -n $sh$fd ]]; then
+    strip="${W}x${sh_h},0,${sy},${${sh:-$fd}#%}"
+  fi
+  if [[ -n $top && -n $strip ]]; then body="${W}x${H},0,0[${top},${strip}]"
+  elif [[ -n $top ]]; then body=$top
+  elif [[ -n $strip ]]; then body=$strip
+  else return; fi
+  # tmux wants a 16-bit rotating checksum in front of the layout.
+  local c=0 ch
+  for ch in ${(s::)body}; do
+    (( c = ((c >> 1) + ((c & 1) << 15) + #ch) & 0xffff ))
+  done
+  $T select-layout -t $W0 "$(printf '%04x' $c),$body"
+}
+
+# show <pane>: swap that Claude pane into the big spot and focus it.
+show() {
+  local id=$1 main
+  [[ -n $id ]] || return
+  lock
+  {
+    main=$(claude_here | head -1)
+    if [[ -z $main ]]; then $T join-pane -d -h -b -s $id -t $(role_pane info)
+    elif [[ $id != $main ]]; then $T swap-pane -d -s $id -t $main; fi
+    $T set -w -t $W0 @main $id \; select-window -t $W0
+  } always { unlock }
+  $T select-pane -t $id   # fires the relayout hook, so after unlocking
+}
+
+# add_pane <dir> [fresh [claude args...]]: open a project in a new hidden
+# window (bring it up with `show`); fresh=1 starts a new conversation
+# instead of resuming, with any extra args passed on to claude.
+add_pane() {
+  local d=$1 fresh=${2:-0} p=$(tab_project $1) id
+  shift $(( $# < 2 ? $# : 2 ))
+  id=$($T new-window -d -t panes: -c $d -e PANE_FRESH=$fresh -e PANE_ARGS="${(j: :)${(q)@}}" \
+    -P -F '#{pane_id}' "$run") || return 1
+  $T set -p -t $id @dir $d \; set -p -t $id @proj $p \; select-pane -t $id -T "$(tab_emoji $p) $p"
+  print -r -- $id
+}
+
+# ensure_pane <role> <title> <command>: put the dashboard / shell / list
+# back if it was closed.
+ensure_pane() {
+  [[ -n $(role_pane $1) ]] && return
+  local id
+  id=$($T split-window -d -t $W0 -c $PANES_ROOT -P -F '#{pane_id}' "$3") || return
+  $T set -p -t $id @$1 1 \; set -p -t $id @proj "~$1" \; select-pane -t $id -T "$2"
+}
+ensure_info()  { ensure_pane info "◆ focus" "exec $self --info"; }
+ensure_shell() { ensure_pane shell "⌨️  shell" "ZDOTDIR=$HOME/.claude/panes-shell exec zsh -i"; }
+ensure_list()  { ensure_pane list "☰ sessions" "exec $self --list"; }
+
+# list: bottom right. One line per session — name, status, effort, topic;
+# the one in the big pane in orange —
+# redrawn every second. Click a session (or press its number) to swap it
+# into the big pane.
+list() {
+  local e=$'\e' k buf n W H main out id title st eff topic dot sub
+  local -a rows ids
+  print -n "${e}[?25l${e}[?1000h${e}[?1006h"   # hide cursor, report clicks
+  trap 'print -n "${e}[?1000l${e}[?1006l${e}[?25h"' EXIT
+  while true; do
+    read W H <<< "$($T display -p -t $TMUX_PANE '#{pane_width} #{pane_height}')"
+    main=$($T show -wqv -t $W0 @main)
+    rows=() ids=() n=0 out="${e}[H"
+    $T list-panes -s -t panes -F '#{@dir}|#{pane_id}|#{@proj}|#{pane_title}|#{@state}|#{@effort}|#{@topic}' 2>/dev/null |
+      awk -F'|' '$1!=""' | sort -t'|' -k3,3 -k4,4 |
+      while IFS='|' read -r _ id _ title st eff topic; do
+        (( ++n )); ids+=($id) rows+=($id)
+        case $st in
+          waiting) dot="${e}[38;5;203m● needs you" ;;
+          working) dot="${e}[38;5;179m● working  " ;;
+          done)    dot="${e}[38;5;108m● done     " ;;
+          *)       dot="${e}[38;5;243m●          " ;;
+        esac
+        # "1 🟢 api-cb          ● needs you  high · Fix pane titles"
+        sub=${eff}${eff:+${topic:+ · }}${topic}
+        local room=$(( W - 2 - 18 - 13 - 1 ))
+        (( room < 0 )) && room=0
+        (( $#sub > room )) && sub="${sub[1,room-1]}…"
+        (( room == 0 )) && sub=
+        if [[ $id == $main ]]; then out+="${e}[38;5;208;1m$n ${(r:18:)title}${e}[0m"
+        else out+="${e}[38;5;243m$n ${e}[0;1m${(r:18:)title}${e}[0m"; fi
+        out+="${dot}${e}[0m  ${e}[38;5;243m${sub}${e}[0m${e}[K"$'\n'
+      done
+    (( n )) || out+="${e}[38;5;243m no Claude sessions — type \`panes\` in the shell${e}[0m${e}[K"
+    print -rn -- "$out${e}[J"
+    read -t 1 -s -k 1 k || continue
+    if [[ $k == $e ]]; then
+      buf=
+      while read -t 0.05 -s -k 1 k; do buf+=$k; [[ $k == [Mm] ]] && break; done
+      # A left-button press: ESC [ < 0 ; column ; row M
+      [[ $buf =~ '^\[<0;[0-9]+;([0-9]+)M$' ]] && [[ -n $rows[$match[1]] ]] && show $rows[$match[1]]
+    elif [[ $k == [1-9] && -n $ids[$k] ]]; then
+      show $ids[$k]
+    fi
+  done
+}
+
+# info: the right-hand column — what the session in the big pane is doing,
+# redrawn every 2s:
+#   - its live spinner line ("Churning… 2m 31s") and context use
+#   - a sparkline of its tool calls per minute over the last half hour
+#   - a trail of its latest tool calls (edits, commands, searches, reads)
+#   - the files it has changed this session
+#   - git changes, the branch's PR + checks, and the project's last handoff
+#     note (~/.claude/recaps/<project>.md, if you keep one)
+# The transcript path and context come from tab-state.sh (@tp) and
+# panes-feed.sh (@ctx).
+info() {
+  local e=$'\e'
+  local R="${e}[0m" DIM="${e}[38;5;243m" B="${e}[1m" SEC="${e}[38;5;110;1m"
+  local W H main d proj title topic ctx tp now f age gs head br ab l c i h r s pr num state ptitle chk rev when spin n t k max spark total axis
+  local -a L ch calls files bins lv
+  local -A seen
+  local cache=~/.claude/.panes-cache; mkdir -p $cache
+  print -n "${e}[?25l"; trap 'print -n "${e}[?25h"' EXIT
+
+  # clip <n> <text>: cut plain text to n columns.
+  clip() { (( $#2 > $1 )) && print -rn -- "${2[1,$1-1]}…" || print -rn -- "$2"; }
+  # ago <epoch>: "now", "4m", "2h".
+  ago() {
+    local s=$(( now - $1 ))
+    (( s < 60 )) && { print -n now; return; }
+    (( s < 3600 )) && { print -n "$(( s / 60 ))m"; return; }
+    print -n "$(( s / 3600 ))h"
+  }
+  section() { L+=("" "${SEC}$1${R}${2:+  ${DIM}$2${R}}"); }
+  # icon <tool>: a coloured glyph per kind of tool call.
+  icon() {
+    case $1 in
+      Edit|MultiEdit|Write|NotebookEdit) print -rn -- "${e}[38;5;179m✎" ;;
+      Bash)                              print -rn -- "${e}[38;5;108m❯" ;;
+      Grep|Glob)                         print -rn -- "${e}[38;5;110m⌕" ;;
+      Read)                              print -rn -- "${e}[38;5;246m◇" ;;
+      Web*)                              print -rn -- "${e}[38;5;141m◎" ;;
+      Agent|Task)                        print -rn -- "${e}[38;5;175m⧉" ;;
+      *)                                 print -rn -- "${e}[38;5;243m•" ;;
+    esac
+  }
+
+  while true; do
+    read W H <<< "$($T display -p -t $TMUX_PANE '#{pane_width} #{pane_height}')"
+    now=$(date +%s) L=()
+    main=$($T show -wqv -t $W0 @main)
+    if [[ -z $main ]]; then
+      L+=("" "${DIM} no session in the big pane${R}")
+    else
+      IFS=$'\x1f' read -r d proj title topic ctx tp <<< \
+        "$($T display -p -t $main $'#{@dir}\x1f#{@proj}\x1f#{pane_title}\x1f#{@topic}\x1f#{@ctx}\x1f#{@tp}')"
+      L+=(" ${e}[38;5;208;1m${title}${R}${ctx:+  ${DIM}ctx ${ctx%.*}%${R}}")
+      [[ -n $topic ]] && L+=(" ${DIM}$(clip $((W - 2)) $topic)${R}")
+
+      # ---- now: the spinner line Claude is showing ----
+      spin=$($T capture-pane -p -S -60 -t $main 2>/dev/null |
+        sed -nE 's/^[✻✽✢✶✳·*] +([A-Z][a-z]+(…| for ).*)$/\1/p' | tail -1)
+      [[ -n $spin ]] && L+=("" " ${e}[38;5;179m✻${R} $(clip $((W - 4)) $spin)")
+
+      # ---- activity, trail, files: from the session's transcript ----
+      if [[ -f $tp ]]; then
+        calls=(${(f)"$(grep '"type":"assistant"' $tp | tail -n 400 | jq -r '
+          (.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdate) as $t | .message.content[]? |
+          select(.type == "tool_use") |
+          [$t, .name, ((.input.file_path // .input.command // .input.pattern // .input.url //
+            .input.description // .input.query // "") | tostring | split("\n")[0])] | join("\u001f")' 2>/dev/null)"})
+
+        # Sparkline: tool calls per minute, last N minutes (one column each).
+        n=$(( W - 4 )); (( n > 30 )) && n=30
+        bins=(${(s: :)${(l:$((n * 2)):: 0:)}})
+        max=0 spark="" total=0
+        for l in $calls; do
+          t=${l%%$'\x1f'*}; k=$(( (now - t) / 60 ))
+          (( k < n )) && { (( bins[n - k]++ )); (( total++ )); }
+        done
+        for k in $bins; do (( k > max )) && max=$k; done
+        lv=(" " ▁ ▂ ▃ ▄ ▅ ▆ ▇ █)
+        for k in $bins; do
+          (( max )) && spark+=$lv[$(( k == 0 ? 1 : 2 + (k * 7 + max - 1) / max - 1 ))] || spark+=" "
+        done
+        section ACTIVITY "$total calls · last ${n}m"
+        axis="${n}m"
+        L+=(" ${e}[38;5;108m${spark}${R}" " ${DIM}${(r:$((n - 3)):: :)axis}now${R}")
+
+        # Trail: newest first.
+        section TRAIL
+        i=0
+        for l in ${(Oa)calls}; do
+          (( ++i > 8 )) && break
+          IFS=$'\x1f' read -r t h s <<< "$l"
+          s=${s#$d/}; s=${s/#$HOME/\~}; s=${s#cd *&& }   # drop a leading "cd x &&"
+          L+=(" $(icon $h)${R} $(clip $((W - 9)) ${s:-$h}) ${DIM}$(ago $t)${R}")
+        done
+        (( i )) || L+=(" ${DIM}no tool calls yet${R}")
+
+        # Files changed this session, most recent first.
+        files=() seen=()
+        for l in ${(Oa)calls}; do
+          IFS=$'\x1f' read -r t h s <<< "$l"
+          [[ $h == (Edit|MultiEdit|Write|NotebookEdit) && -n $s ]] || continue
+          (( ${+seen[$s]} )) && { (( seen[$s]++ )); continue; }
+          seen[$s]=1; files+=($s)
+        done
+        if (( $#files )); then
+          section "FILES CHANGED" "$#files"
+          for s in ${files[1,6]}; do
+            r=${s#$d/}; r=${r/#$HOME/\~}
+            L+=(" ${e}[38;5;179m✎${R} $(clip $((W - 9)) $r) ${DIM}×$seen[$s]${R}")
+          done
+          (( $#files > 6 )) && L+=(" ${DIM}  … $(( $#files - 6 )) more${R}")
+        fi
+      fi
+
+      # ---- git ----
+      gs=$(git -C $d --no-optional-locks status --porcelain=v1 -b 2>/dev/null)
+      if [[ -n $gs ]]; then
+        head=${${(f)gs}[1]#\#\# } ab=""
+        br=${head%%...*}; br=${br%% *}
+        [[ $head == *ahead\ ([0-9]##)* ]] && ab+=" ↑${${head##*ahead }%%[],]*}"
+        [[ $head == *behind\ ([0-9]##)* ]] && ab+=" ↓${${head##*behind }%%[]]*}"
+        ch=(${${(f)gs}[2,-1]})
+        section GIT "$br$ab · $#ch uncommitted"
+
+        # ---- PR (gh is slow: cached per directory, refreshed in the background) ----
+        f=$cache/pr-${${d//\//_}}
+        age=$(( now - $(stat -f %m $f 2>/dev/null || print 0) ))
+        if (( age > 60 )) && [[ ! -e $f.lock ]]; then
+          ( touch $f.lock; cd $d && gh pr view --json number,title,state,statusCheckRollup,reviewDecision > $f.tmp 2>/dev/null \
+              && mv $f.tmp $f || print -n '{}' > $f; rm -f $f.tmp $f.lock ) &!
+        fi
+        pr=$(jq -r 'select(.number) | [.number, .state, .title, ([.statusCheckRollup[]? | .conclusion // .state // .status] | map(ascii_upcase) | (if any(. == "FAILURE" or . == "ERROR" or . == "TIMED_OUT" or . == "CANCELLED") then "fail" elif any(. == "IN_PROGRESS" or . == "QUEUED" or . == "PENDING" or . == "EXPECTED") then "run" elif length > 0 then "pass" else "" end)), (.reviewDecision // "")] | join("\u001f")' $f 2>/dev/null)
+        if [[ -n $pr ]]; then
+          IFS=$'\x1f' read -r num state ptitle chk rev <<< "$pr"
+          case $chk in
+            pass) chk="${e}[38;5;108m✓ checks pass" ;;
+            fail) chk="${e}[38;5;203m✗ checks failing" ;;
+            run)  chk="${e}[38;5;179m● checks running" ;;
+          esac
+          [[ $rev == APPROVED ]] && rev=" ${e}[38;5;108m✓ approved" || { [[ $rev == CHANGES_REQUESTED ]] && rev=" ${e}[38;5;203m✗ changes asked" || rev=; }
+          L+=(" PR #$num ${DIM}${(L)state}${R}  ${chk}${R}${rev}${R}")
+          L+=(" ${DIM}$(clip $((W - 2)) $ptitle)${R}")
+        fi
+      fi
+
+      # ---- last handoff note ----
+      f=~/.claude/recaps/$proj.md
+      if [[ -f $f ]]; then
+        when=$(sed -n '1s/^<!-- \([0-9-]* [0-9:]*\).*/\1/p' $f)
+        section "LAST HANDOFF" "$when"
+        sed -n 's/^### //p' $f | head -1 | fold -s -w $((W - 2)) | while read -r l; do L+=(" ${B}$l${R}"); done
+        sed -n '/^\*\*Left off/,$p' $f | sed -n 's/^- //p' | head -2 |
+          while read -r l; do
+            print -r -- $l | fold -s -w $((W - 4)) | {
+              read -r s; L+=(" ${e}[38;5;179m›${R} $s")
+              while read -r s; do L+=("   $s"); done
+            }
+          done
+      fi
+    fi
+    print -rn -- "${e}[H"
+    for (( i = 1; i <= H && i <= $#L; i++ )); do print -rn -- "$L[i]${e}[K"; (( i < H )) && print; done
+    print -rn -- "${e}[J"
+    sleep 2
+  done
+}
+
+case $1 in
+  -h|--help|help|guide) sed '$d' ~/.claude/panes-guide.txt; exit ;;
+  -k) $T kill-session -t panes 2>/dev/null && print "Closed panes." || print "No panes running."; exit ;;
+  --relayout) relayout; exit ;;
+  --list) list; exit ;;
+  --info) info; exit ;;
+  --show) show $2; exit ;;
+  # `claude` typed in the shell strip (see ~/.claude/panes-shell/.zshrc):
+  # open it as a new session in the big pane, so the shell stays a shell.
+  --new) shift; d=$1; shift; id=$(add_pane $d 1 "$@") && show $id; exit ;;
+  --pick)
+    # The ⌃b p popup: numbered list of $PANES_ROOT projects not already open.
+    typeset -a have projs
+    have=(${(f)"$(open_dirs)"})
+    for d in $PANES_ROOT/*(/N); do
+      (( ${have[(Ie)$(project_dir ${d:t})]} )) || projs+=(${d:t})
+    done
+    (( $#projs )) || { print "Every project is already open."; read -sk1; exit; }
+    print "\n  open a project\n"
+    for i in {1..$#projs}; do printf "  %2d  %s %s\n" $i "$(tab_emoji $projs[i])" $projs[i]; done
+    print -n "\n  number or name (enter to cancel): "
+    read -r pick
+    [[ -z $pick ]] && exit
+    [[ $pick == <-> ]] && pick=$projs[pick]
+    exec ${0:A} $pick ;;
+esac
+
+# ---- which directories ----
+# Typed in the panes shell strip: no args or `.` → a new session right here.
+in_panes=0; [[ $TMUX == */claude,* ]] && in_panes=1
+fresh=0
+if (( in_panes )) && [[ $# == 0 || $* == . ]]; then
+  [[ $PWD == $PANES_ROOT ]] && exec ${0:A} --pick   # not in a project: pick one
+  set -- .; fresh=1
+fi
+typeset -aU dirs
+if (( $# )); then
+  for a in $@; do
+    d=$(project_dir $a) && dirs+=($d) || print "panes: no project '$a'"
+  done
+elif ! $T has-session -t panes 2>/dev/null; then
+  # The most recent projects you've had Claude conversations in, newest
+  # first (one per project, each at the dir its last conversation used).
+  typeset -A seen
+  for f in ~/.claude/projects/*/*.jsonl(Nom); do
+    d=$(grep -m1 -o '"cwd":"[^"]*"' $f | sed 's/^"cwd":"//; s/"$//')
+    [[ $d == $PANES_ROOT(|/*) && -d $d ]] || continue
+    p=$(tab_project $d)
+    (( ${+seen[$p]} )) && continue
+    seen[$p]=1; dirs+=($d)
+    (( $#dirs >= RECENT )) && break
+  done
+  (( $#dirs )) || { print "No recent projects found. Try: panes <project> <project>"; exit 1; }
+fi
+
+# ---- already running: add any new projects, show the last one ----
+if $T has-session -t panes 2>/dev/null; then
+  have=(${(f)"$(open_dirs)"})
+  new=
+  for d in $dirs; do
+    if (( ! fresh && ${have[(Ie)$d]} )); then
+      new=$($T list-panes -s -t panes -F '#{@dir}|#{pane_id}' | awk -F'|' -v d=$d '$1==d{print $2; exit}')
+    else
+      new=$(add_pane $d $fresh)
+    fi
+  done
+  ensure_shell; ensure_list
+  [[ -n $new ]] && show $new
+  relayout
+  [[ -n $TMUX ]] && exit
+  exec $T attach -t panes
+fi
+
+# ---- fresh start (uses the Terminal window as it is; no resizing) ----
+# Start focused on the most recent project that isn't busy in another tab
+# (a pane for one that is just waits, so it shouldn't get the big spot).
+busy=(${(f)"$(command claude agents --json 2>/dev/null | jq -r '.[] | select(.kind == "interactive") | .cwd')"})
+focus=$dirs[1]
+for d in $dirs; do (( ${busy[(Ie)$d]} )) || { focus=$d; break; }; done
+w=${COLUMNS:-0} h=${LINES:-0}; (( w >= 40 )) || w=200; (( h >= 10 )) || h=50
+p=$(tab_project $focus)
+first=$($T new-session -d -s panes -c $focus -x $w -y $h -P -F '#{pane_id}' "$run")
+$T set -p -t $first @dir $focus \; set -p -t $first @proj $p \; select-pane -t $first -T "$(tab_emoji $p) $p"
+for d in ${dirs:#$focus}; do add_pane $d >/dev/null; done
+ensure_shell; ensure_list
+$T select-window -t $W0 \; select-pane -t $first
+relayout
+
+[[ -n $TMUX ]] && { print "Started panes on its own socket; run \`panes\` from a normal tab to see it."; exit; }
+exec $T attach -t panes
